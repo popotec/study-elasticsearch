@@ -214,7 +214,7 @@ flowchart TB
 | `master` | 클러스터 상태(메타데이터) 관리, 노드/샤드 배치 결정. 데이터 저장·검색은 하지 않음 |
 | `data` | 샤드 저장, 실제 검색/색인 실행. CPU·디스크 I/O를 가장 많이 씀 |
 | `ingest` | 색인 전 파이프라인(전처리) 실행. 보통 data 노드와 겸임 |
-| `remote_cluster_client` | 원격 클러스터 검색(CCS)·복제(CCR)에 필요. Kibana의 일부 기능(Stack Monitoring에서 원격 클러스터를 조회하는 경로 등)이 이 역할을 요구하기 때문에, 이 역할이 없는 노드에만 Kibana가 붙어 있으면 해당 기능이 막힐 수 있음 (겪었던 실제 이슈 — 자세한 원인 분석과 대응 전략은 5장에서) |
+| `remote_cluster_client` | 공식 명칭은 **remote-eligible node**. 다른 클러스터에 나가서 붙는 "크로스 클러스터 클라이언트" 역할로, 원격 클러스터 검색(CCS)·복제(CCR)에 필수. **기본 역할 집합에 원래 포함돼 있다**는 점이 중요 (바로 아래 상세 참고) |
 | 역할 없음(`[]`) | coordinating-only 노드. 사실 모든 노드가 기본적으로 coordinating 기능을 갖고 있어서, "이것만 하는" 노드를 별도로 만들 때만 의미가 있음 |
 
 ```yaml
@@ -237,6 +237,183 @@ es-data01:
 - **coordinating-only**: 위 세 역할과 달리 아예 "아무 역할도 없는" 노드를 별도로 두는 패턴. 대규모 클러스터에서 클라이언트 요청을 받아 분산(scatter-gather)만 전담시켜 data 노드의 검색 부하를 줄이는 용도
 
 일반적인 원칙: **노드 수와 트래픽이 작을수록 역할을 묶어서 자원을 아끼고, 특정 역할의 부하가 커지거나(CPU 경합, 네트워크·보안 경계 필요) 장애 영향 범위를 좁혀야 할 때 그 역할부터 순차적으로 분리**한다. 우리 학습 환경(`es-data01` 하나가 `data,ingest,remote_cluster_client`를 겸임)은 규모가 작아 아직 그 정도 부하가 없어서 분리하지 않은 것 — 이 판단 기준 자체가 5장 클러스터 구성 전략과 이어짐.
+
+#### 운영 환경에서 검색 요청은 어디로 들어가고, gather 부하는 어떻게 분산되나
+
+우리 실습 환경은 **자원을 아끼려고 data 노드를 1대만 둔 축약형**이라, 실제 운영 클러스터에서 벌어지는 분산 과정이 거의 보이지 않는다. 노드가 늘어나면 그림이 어떻게 달라지는지 짚어두면 5장으로 넘어가기 좋다.
+
+**먼저 검색이 2단계라는 것부터**
+
+요청을 받은 노드가 그 요청의 **코디네이팅 노드**가 되고, 이후 두 단계로 진행된다.
+
+| 단계 | 하는 일 |
+|---|---|
+| **Query phase** (scatter) | 코디네이팅 노드가 라우팅 테이블을 보고 대상 샤드를 가진 노드들에 요청을 뿌림. 각 샤드는 로컬 검색 후 **문서 본문이 아니라 문서 ID와 정렬용 점수만** 회신 |
+| **Gather / Fetch phase** | 코디네이팅 노드가 회신을 병합해 전역 상위 N건을 추리고, **그 N건에 대해서만** 해당 샤드에 `_source`를 요청해 실제 문서를 가져와 최종 응답을 조립 |
+
+본문을 두 번에 나눠 가져오는 이유가 여기 있다. 샤드 10개에서 각각 10건씩 받아도 최종 필요한 건 10건인데, 처음부터 본문까지 다 실어 나르면 90건이 통째로 낭비된다.
+
+**핵심은 gather 단계가 코디네이팅 노드 한 곳에 몰린다는 것**이다. 정렬·병합·집계 병합을 이 노드가 혼자 하므로 메모리와 CPU를 크게 쓴다. 그래서 "누가 요청을 받느냐"가 곧 "누가 이 부하를 지느냐"가 되고, 이걸 어떻게 분산할지가 아래 두 패턴이다.
+
+```mermaid
+flowchart TB
+    subgraph pa["패턴 A · 중소 규모 — data 노드가 코디네이터 겸임"]
+        direction TB
+        ca["클라이언트 서버"]
+        la["로드밸런서 또는<br/>클라이언트 라이브러리의 노드 목록<br/>요청마다 대상 노드 회전"]
+        a1["data-01<br/>이번 요청의 코디네이터<br/>자기 샤드는 네트워크 없이 로컬 처리"]
+        a2["data-02"]
+        a3["data-03"]
+        ca --> la
+        la --> a1
+        a1 -->|"scatter · gather"| a2
+        a1 -->|"scatter · gather"| a3
+    end
+
+    subgraph pb["패턴 B · 대규모 — coordinating-only 노드로 분리"]
+        direction TB
+        cb["클라이언트 서버"]
+        lbb["로드밸런서"]
+        co1["coord-01<br/>역할 목록을 비운 노드<br/>gather 전담"]
+        co2["coord-02<br/>역할 목록을 비운 노드<br/>gather 전담"]
+        b1["data-01<br/>샤드 검색에 집중"]
+        b2["data-02<br/>샤드 검색에 집중"]
+        b3["data-03<br/>샤드 검색에 집중"]
+        cb --> lbb
+        lbb --> co1
+        lbb --> co2
+        co1 -->|"scatter · gather"| b1
+        co1 --> b2
+        co1 --> b3
+        co2 --> b1
+        co2 --> b2
+        co2 --> b3
+    end
+
+    mst["전용 마스터 노드<br/>이 경로에 끼워넣지 않는다"]
+
+    style a1 fill:#e7f1ff,stroke:#36c
+    style co1 fill:#e7f1ff,stroke:#36c
+    style co2 fill:#e7f1ff,stroke:#36c
+    style mst fill:#f8d7da,stroke:#c00
+```
+
+**패턴 A — data 노드가 직접 받는다 (대부분의 경우 이걸로 충분)**
+
+클라이언트 앞에 로드밸런서를 두거나, 클라이언트 라이브러리에 **노드 목록을 여러 개** 넘긴다. 공식 클라이언트는 이 목록을 라운드로빈으로 돌기 때문에 **요청마다 코디네이팅 노드가 바뀌고**, 그 결과 gather 부하가 data 노드들에 자연스럽게 나눠진다. 코디네이터가 된 노드는 자기가 가진 샤드를 네트워크 홉 없이 로컬에서 처리하므로 마스터가 받는 것보다 홉이 하나 줄어드는 이점도 있다.
+
+같은 샤드의 복제본이 여러 개일 때 **어느 복제본으로 보낼지**는 단순 라운드로빈이 아니라 **Adaptive Replica Selection**(7.0부터 기본 활성)이 각 복제본의 응답 시간과 큐 길이를 재서 고른다. 느려진 노드를 알아서 피해 가므로, 별도 튜닝 없이도 복제본 단위 부하 분산이 이루어진다.
+
+**패턴 B — coordinating-only 노드를 앞단에 분리한다**
+
+검색 트래픽이 커져서 gather 부하가 data 노드의 샤드 검색 성능을 갉아먹기 시작하면, `node.roles`를 빈 목록으로 둔 노드를 별도로 세워 **요청 수신과 scatter-gather만 전담**시킨다. data 노드는 샤드 검색에만 집중하게 되고, coordinating 노드는 디스크가 거의 필요 없는 대신 메모리와 CPU 위주로 스펙을 잡는다.
+
+> ⚠️ **coordinating-only 노드를 무작정 늘리면 역효과**: 공식 문서가 이 점을 명시적으로 경고한다. 이 노드들도 클러스터의 정식 멤버라서 전체 클러스터 상태 사본을 받고, **마스터는 클러스터 상태를 갱신할 때마다 모든 노드의 ack를 기다려야** 한다. 노드 수가 늘수록 그 대기 비용이 커진다. 문서 표현 그대로 옮기면 *"coordinating-only 노드의 이점을 과대평가하지 말 것 — data 노드도 같은 역할을 충분히 잘 수행한다."* 즉 **패턴 A가 기본이고, 패턴 B는 부하를 실제로 측정해서 병목이 확인됐을 때 가는 단계**다.
+
+**두 패턴 모두에서 지켜야 할 것: 전용 마스터에는 클라이언트를 붙이지 않는다**
+
+마스터도 기술적으로는 REST 요청을 받고 코디네이팅 동작을 한다. 하지만 gather 단계의 메모리·CPU 부하가 마스터 안정성을 직접 위협하고, 마스터가 흔들리면 불필요한 재선출로 이어진다. 공식 문서도 "마스터 노드가 코디네이팅 동작을 하긴 하지만 **그 용도로 쓰지 말라**"고 못 박는다. 우리 compose에서 Kibana를 `es-master01`이 아니라 `es-data01:9200`으로 물려둔 것이 바로 이 원칙을 따른 구성이다.
+
+**우리 실습 환경과의 대비**
+
+| | 실습 환경 | 운영 환경 |
+|---|---|---|
+| data 노드 | 1대 (`es-data01`) | 보통 3대 이상 |
+| 코디네이팅 노드 | 사실상 `es-data01` 고정 | 요청마다 회전 (LB 또는 클라이언트 노드 목록) |
+| scatter 대상 | 없음 — 자기 자신뿐 | 대상 샤드를 가진 모든 노드 |
+| gather 부하 | `es-data01`에 전부 집중 | 코디네이터들에 분산, 필요 시 coordinating-only로 분리 |
+
+즉 지금 우리 환경에서 보이지 않는 건 "분산"이지 "구조"가 아니다. 흐름 자체는 동일하고, 참여하는 노드 수만 1로 줄어든 형태다.
+
+#### `remote_cluster_client` 자세히 보기 — 우리 compose에 왜 이게 붙어 있나
+
+발표 때 "원격 클러스터도 없는데 이건 왜 넣었냐"는 질문이 나오기 딱 좋은 항목이라 따로 정리한다. 결론부터 말하면 **추가한 게 아니라 기본값에서 살려둔 것**에 가깝다.
+
+**① `node.roles`는 "추가"가 아니라 "통째로 교체"다**
+
+`node.roles`를 아예 지정하지 않으면 엘라스틱서치가 노드에 기본으로 부여하는 역할은 다음 11개다.
+
+```
+master, data, data_content, data_hot, data_warm, data_cold, data_frozen,
+ingest, ml, remote_cluster_client, transform
+```
+
+즉 `remote_cluster_client`는 **원래 켜져 있는 역할**이다. 그런데 `node.roles`를 한 번이라도 명시하는 순간, 노드는 **거기 적은 역할만** 갖게 된다(기존 기본값에 얹는 게 아니라 대체). 공식 문서도 이 지점을 콕 집어 경고한다 — *"`node.roles`를 설정한다면, 클러스터에 필요한 모든 역할을 빠짐없이 적어라."*
+
+이 관점으로 우리 `docker-compose.yml`을 다시 보면 의미가 달라진다.
+
+| 노드 | 지정한 역할 | 기본값 대비 |
+|---|---|---|
+| `es-master01~03` | `master` | `ingest`, `ml`, `transform`, `remote_cluster_client`, 모든 `data_*`가 **전부 빠짐** — 의도된 전용 마스터 |
+| `es-data01` | `data,ingest,remote_cluster_client` | 기본값 중 학습에 필요한 것만 **골라 남긴 것** (`ml`, `transform`은 버림) |
+
+그래서 발표에서는 "왜 굳이 붙였나"가 아니라 **"명시하는 순간 다 날아가니까 필요한 걸 살려둔 것"** 으로 설명하는 게 정확하다. 이건 실무에서 `node.roles`를 손댈 때 가장 흔하게 사고 나는 지점이기도 하다 — 역할 하나 바꾸려다 안 적은 역할이 통째로 사라져서 Kibana 기능이나 파이프라인이 조용히 죽는 식.
+
+**② 어디에 실제로 필요한가 (공식 문서 기준)**
+
+| 상황 | 필요 여부 |
+|---|---|
+| CCS(크로스 클러스터 검색), CCR(크로스 클러스터 복제) | **필수** |
+| CCS 요청을 최초로 받는 로컬 **코디네이팅 노드** | **필수** — 이 노드가 원격에 나가는 주체 |
+| `ml` / `transform` 전용 노드 | 선택이지만 **강력 권장**. 없으면 ML job·datafeed·transform 내부에서 CCS가 실패 |
+| 이상 탐지(anomaly detection)에서 CCS 사용 시 | **모든 master-eligible 노드에도** 필요 — 없으면 datafeed가 아예 시작 안 됨 |
+
+마지막 줄이 특히 함정이다. "마스터는 데이터 일 안 하니까 역할 최소화" 원칙을 그대로 따랐는데, ML이 원격 데이터를 보는 순간 마스터 노드에서 datafeed가 멈춘다.
+
+**③ 원격 클러스터에 어떻게 붙는가 — 연결 모드 2가지**
+
+```mermaid
+flowchart LR
+    subgraph local["로컬 클러스터"]
+        direction TB
+        co["코디네이팅 노드<br/>remote_cluster_client 보유"]
+    end
+
+    subgraph remote["원격 클러스터"]
+        direction TB
+        seed["seed 노드"]
+        gw1["게이트웨이 노드 1"]
+        gw2["게이트웨이 노드 2"]
+        gw3["게이트웨이 노드 3"]
+        mst["전용 마스터 노드<br/>게이트웨이로 절대 선정 안 됨"]
+    end
+
+    co -->|"① seeds 설정으로 최초 접속"| seed
+    seed -->|"② 게이트웨이 노드 주소 최대 3개 회신"| co
+    co -->|"③ 각 게이트웨이의 publish address로<br/>TCP 연결 직접 수립"| gw1
+    co --> gw2
+    co --> gw3
+
+    style co fill:#e7f1ff,stroke:#36c
+    style mst fill:#f8d7da,stroke:#c00
+```
+
+- **sniff 모드 (기본값)**: `cluster.remote.<alias>.seeds`에 seed 노드를 적어두면, ES가 거기서 **게이트웨이 노드 주소를 최대 3개** 받아온다. 그다음 로컬 클러스터의 **각 `remote_cluster_client` 노드**가 그 게이트웨이들의 publish address로 직접 TCP 연결을 연다 → **원격 노드의 publish address가 로컬에서 접근 가능해야 함**
+  - 게이트웨이 노드 선정 기준: 버전 호환 + **master-eligible이 아닌 노드**(전용 마스터는 절대 선정되지 않음) + `cluster.remote.node.attr.gateway` 속성으로 직접 지정 가능
+- **proxy 모드**: `cluster.remote.<alias>.mode: proxy` + `proxy_address`로 **L4 리버스 프록시 하나만** 바라본다. 원격 노드 각각의 publish address가 로컬에 열려 있지 않아도 되므로, 방화벽·NAT·클라우드 네트워크 제약이 있을 때 사실상 유일한 선택지
+
+**④ 보안 모델 2가지**
+
+- **API 키 기반** (양쪽 클러스터 8.14 이상): 원격 클러스터 관리자가 무엇을 열어줄지 세밀하게 제어 가능. 신규 구성이라면 이쪽이 기본 선택
+- **인증서 기반** (mTLS): 사용자 인증은 로컬에서 하고 역할 이름만 원격에 전달하는 방식이라, **로컬의 superuser가 원격 클러스터 전체에 대한 읽기 권한을 자동으로 갖게 된다.** 그래서 공식 문서도 "같은 보안 도메인에 있는 클러스터끼리만 적합"하다고 명시
+
+> ⚠️ 완전한 CCS 기능을 쓰려면 로컬과 원격 클러스터의 **구독(subscription) 레벨이 같아야** 한다. 한쪽만 상위 라이선스면 일부 기능이 제한된다.
+
+**⑤ 우리 실습 환경에서 지금 이 역할이 하는 일 — 사실상 없음**
+
+원격 클러스터를 하나도 등록하지 않았으니, 이 역할은 "쓸 준비만 된 상태"로 놀고 있다. 실제로 확인해볼 수 있다.
+
+```
+# 각 노드가 실제로 어떤 역할을 갖고 있는지 (약어 대신 정확한 이름으로)
+GET _nodes/es-data01?filter_path=nodes.*.roles
+
+# 등록된 원격 클러스터 목록 → 지금은 빈 객체 {} 가 나온다
+GET _remote/info
+```
+
+`GET _remote/info`가 `{}`를 반환하는 걸 보여주면 "역할은 있지만 연결된 원격 클러스터가 없다"가 한눈에 전달된다. 실제 CCS/CCR 구성과 운영 전략은 5장에서 이어서 다룬다.
+
+> 🔎 **Kibana Stack Monitoring과의 관계 정리**: Stack Monitoring 기능 자체가 요구하는 역할은 `remote_cluster_client`가 아니라 **`ingest`** 다(모니터링 데이터를 파이프라인으로 적재하기 때문). `remote_cluster_client`가 필요해지는 건 **모니터링 데이터를 별도의 모니터링 전용 클러스터에 두고 CCS로 건너가 읽을 때** — 이때 Kibana가 붙어 있는 노드에 이 역할이 없으면 원격 조회 경로가 막힌다. 우리 compose에서 `es-data01`이 `ingest`와 `remote_cluster_client`를 **둘 다** 들고 있고 Kibana가 이 노드만 바라보게 되어 있는 건 이 두 경로를 모두 열어두기 위한 구성이다. (겪었던 실제 이슈의 원인 분석과 대응 전략은 5장에서)
 
 > 🔎 **마스터가 관리하는 "클러스터 상태(cluster state)"란 정확히 뭘까**: 위 표에서 "클러스터 상태(메타데이터) 관리"라고만 짧게 썼는데, 실제로 여기에 들어가는 정보는 인덱스 매핑·세팅, 어느 샤드가 어느 노드에 있는지를 나타내는 **샤드 라우팅 테이블**, 클러스터에 속한 노드 목록, 인덱스 템플릿, ILM 정책 등 "클러스터를 운영하는 데 필요한 모든 메타데이터"임 (실제 문서 데이터는 포함하지 않음 — 그건 data 노드가 담당). 이 상태는 마스터 노드 하나가 들고 있는 게 아니라 **모든 노드가 사본을 유지**하고, 마스터가 변경 사항이 생길 때마다(인덱스 생성, 샤드 재배치 등) 클러스터 상태를 갱신해서 전체 노드에 전파(publish)함 — 그래서 어떤 노드로 요청을 보내도 "지금 이 인덱스가 어느 샤드에 있는지"를 스스로 알고 요청을 올바른 노드로 라우팅할 수 있는 것. `GET _cluster/state`로 현재 클러스터 상태 전체를 직접 확인해볼 수 있음(실습 환경처럼 작은 클러스터가 아니면 출력이 매우 길어짐에 주의).
 
@@ -302,20 +479,6 @@ flowchart TB
 | 우리 팀 사용 현황 | 책 실습용으로만 사용 | 데모용 | **실제 운영에서 Kibana 대신 사용 중** |
 
 > 한 줄 정리: Kibana는 "데이터를 보는 창", Cerebro는 "클러스터를 보는 계기판", Elasticvue는 "문서를 표로 보는 뷰어". 멀티노드 클러스터의 노드 role·샤드 분산 확인은 Cerebro, 데이터 탐색·시각화는 Kibana, 문서를 테이블처럼 훑어볼 땐 Elasticvue로 나눠 쓰면 됨.
-
-**왜 Cerebro/Elasticvue 접속창에 `localhost:9200`을 넣으면 안 될까?**
-
-Cerebro/Elasticvue도 하나의 Docker 컨테이너다. 컨테이너 안에서 `localhost`는 **자기 자신**을 가리키므로 `http://es-master01:9200`처럼 **서비스명**으로 접속해야 한다.
-
-- 호스트 PC 브라우저에서 `localhost:9200`이 되는 이유: docker-compose의 포트 매핑(`9200:9200`) 덕분
-- 컨테이너 → 컨테이너 통신은 포트 매핑과 무관하고, 같은 Docker 네트워크 안에서 서비스명(=컨테이너명)으로 통신해야 함
-- docker-compose가 프로젝트별로 만드는 기본 네트워크에는 Docker 내장 DNS 서버(`127.0.0.11`)가 자동으로 떠서 같은 네트워크의 컨테이너들을 서비스명으로 등록해줌 (`/etc/hosts` 수동 설정이 아니라 Compose가 자동 제공하는 기능)
-
-```bash
-# 확인용
-docker network ls
-docker inspect <container> --format '{{json .NetworkSettings.Networks}}'
-```
 
 > 🔎 **`_cat` API로 터미널에서 빠르게 들여다보기**: Cerebro/Elasticvue 없이도 터미널에서 클러스터 상태를 바로 확인할 수 있는 REST 엔드포인트들. 장애 상황에서 도구 켤 시간도 없을 때 특히 유용함.
 >
@@ -408,12 +571,6 @@ flush는 다음 조건에서 자동으로 일어나며, 필요하면 수동으�
 - translog 크기가 `index.translog.flush_threshold_size`를 넘을 때 — **8.x 기본값은 10GB**
 - ES가 백그라운드에서 알아서 수행할 때 (translog가 커지면 복구가 느려지므로 ES가 주기적으로 flush를 밀어냄. 추가로 translog 총량은 **디스크 용량의 1%**를 넘지 않도록 제한됨)
 - `POST my-index/_flush`로 직접 호출할 때 (공식 문서 표현으로 "rarely needed" — 실무에서 수동 호출할 일은 거의 없음)
-
-> ⚠️ **책/블로그의 "512MB, 30분"은 옛날 기준**: 한국어 자료에 "translog 512MB 초과 또는 마지막 flush 후 30분 경과"라는 조건이 널리 퍼져 있는데, 둘 다 현행 8.x 기준으로는 맞지 않는다.
-> - **512MB** → `index.translog.flush_threshold_size`의 **7.x까지의 기본값**. 큰 노드가 인덱싱 버퍼를 다 못 쓰는 문제 때문에 상향돼서 **8.x에서는 기본 10GB**다.
-> - **30분** → 아주 예전 버전에 있던 `index.translog.flush_threshold_period` 설정의 잔재. 현행 8.19 공식 문서의 translog 설정 목록에는 `sync_interval`(5s), `durability`(request), `flush_threshold_size`(10GB) 세 가지뿐이고 시간 기반 조건은 없다.
->
-> 발표 때는 "정확한 숫자를 외우기보다 **translog가 너무 커지지 않게 ES가 알아서 flush한다**는 구조를 이해하는 게 핵심"이라고 짚고 넘어가는 게 좋다 — 이 숫자들은 버전마다 실제로 바뀌어 왔다.
 
 ### 3.2 루씬 commit
 메모리에 있던 세그먼트를 디스크에 fsync하여 영속화하는 지점. 커밋 이후의 데이터는 노드가 죽어도 남아있음.
@@ -549,7 +706,34 @@ GET my-index/_doc/1
 - 존재하지 않는 문서 조회 시 `found: false`와 함께 404 반환
 - `_version`은 이 문서가 몇 번 색인/업데이트됐는지를 나타내는 카운터 — PUT/업데이트 때마다 1씩 증가
 
-> 🔎 **Get API는 왜 "준실시간(NRT)"이 아니라 실시간(Real-Time)일까**: 1절 핵심특성 표의 "준실시간(NRT)" 설명은 정확히는 **검색(Search API)**에만 해당함. `GET my-index/_doc/1`처럼 `_id`로 문서 하나를 직접 조회하는 Get API는 다르게 동작함 — 요청한 문서가 아직 refresh 전이라 검색 가능한 세그먼트에 반영되지 않았다면, ES가 내부적으로 **그 순간 즉시 refresh를 강제로 한 번 수행**해서라도 최신 값을 반환함. 즉 방금 색인한 문서를 바로 `GET .../_doc/1`로 조회하면 항상 최신 값이 나오지만, 같은 문서를 `_search`의 쿼리로 찾으면 refresh 주기(기본 1초) 전까지는 안 걸릴 수 있음 — 4.4절 실습에서 이 차이를 직접 체감할 수 있음. (강제 refresh 비용이 부담스러운 상황이라면 `GET my-index/_doc/1?realtime=false`로 이 동작을 끄고 일반 검색과 같은 NRT 방식으로 조회할 수 있음)
+> 🔎 **Get API는 왜 "준실시간(NRT)"이 아니라 실시간(Real-Time)일까**: 1절 핵심특성 표의 "준실시간(NRT)" 설명은 정확히는 **검색(Search API)**에만 해당함. `GET my-index/_doc/1`처럼 `_id`로 문서 하나를 직접 조회하는 Get API는 검색 경로를 아예 타지 않음.
+>
+> 샤드는 **LiveVersionMap**이라는 인메모리 자료구조를 들고 있음 — 최근 색인됐지만 아직 세그먼트로 내려가지 않은 문서의 `_id → 버전·seqNo·위치`를 담고 있는 맵. Get 요청이 오면 ES는 이 맵을 먼저 확인하고, 문서가 여기 있으면 translog나 내부 리더에서 곧바로 꺼내서 반환함. 역색인을 뒤질 필요가 없으니 refresh 주기와 무관하게 항상 최신 값이 나옴.
+>
+> 반면 `_search`는 이 맵을 보지 않음. `_id`가 아니라 **텀(term)으로 문서를 찾아야 하므로 역색인이 만들어져 있어야** 하고, 역색인은 세그먼트가 생겨야(=refresh) 존재함. 그래서 같은 문서라도 Get은 즉시, Search는 refresh 이후에 보임 — 4.4절 실습에서 직접 체감할 수 있음.
+
+> ⚠️ **자주 나오는 오해 — "Get이 강제 refresh를 하니까 그 뒤엔 검색도 되겠지"**: 공식 문서에는 "Get API가 in-place refresh를 수행해 문서를 visible하게 만든다"는 문장이 있지만, 이 refresh는 **internal 스코프 전용**임. 샤드는 리더(searcher)를 두 개 관리함 — Search API가 보는 **external reader**(주기적 `refresh_interval`이 갱신)와, realtime get·버전 조회 전용인 **internal reader**. Get이 유발하는 refresh는 internal 쪽만 전진시키므로 external reader는 그대로고, **Get 직후에 `_search`를 해도 여전히 0건**임. 이 문장 자체가 부정확하다는 이유로 Elastic 내부에서 정정 이슈([#45717](https://github.com/elastic/elasticsearch/issues/45717))가 제기돼 있음.
+>
+> ```
+> PUT test  { "settings": { "refresh_interval": "-1" } }
+> PUT test/_doc/1  { "foo": "bar" }
+>
+> GET test/_search   # hits 0건
+> GET test/_doc/1    # 문서 반환 (Real-Time)
+> GET test/_search   # 여전히 0건  ← 핵심
+> POST test/_refresh # 이때 비로소 external reader 전진
+> GET test/_search   # hits 1건
+> ```
+>
+> **옵션 정리**
+>
+> | 옵션 | 동작 |
+> |---|---|
+> | `GET .../_doc/1` (기본, `realtime=true`) | LiveVersionMap 경유. 항상 최신. 검색 가시성에는 영향 없음 |
+> | `GET .../_doc/1?realtime=false` | 맵을 건너뛰고 세그먼트만 조회 → Search와 같은 NRT 동작 |
+> | `GET .../_doc/1?refresh=true` | **진짜 external refresh를 강제** → 이건 검색까지 반영됨. 대신 비용이 큼 |
+>
+> 운영 관점 한 줄: 색인 직후 get이 몰리는 워크로드에서 `?refresh=true`를 습관적으로 붙이면 refresh가 과하게 잦아져 작은 세그먼트가 폭증하고 병합 부하로 이어짐 (3장 3.1절 refresh_interval 튜닝과 같은 맥락).
 
 ### 4.3 문서 업데이트
 ```
@@ -656,24 +840,29 @@ sequenceDiagram
     autonumber
     participant C as 클라이언트
     participant ES as Elasticsearch 샤드
+    participant LVM as LiveVersionMap · 인메모리
     participant TL as translog · 디스크
-    participant SEG as 세그먼트 · 검색 대상
+    participant SEG as 세그먼트 · external reader가 보는 검색 대상
 
     C->>ES: PUT my-index/_doc/1
     ES->>TL: 기록 + fsync
+    ES->>LVM: _id · 버전 · 위치 등록
     ES-->>C: 201 created · 아직 세그먼트에는 없음
 
     rect rgb(255, 243, 205)
     Note over C,SEG: refresh 이전 구간 · 기본 최대 1초
     C->>ES: GET my-index/_doc/1
-    ES->>ES: 아직 검색 가능 상태 아님 → 즉시 refresh 강제 수행
+    ES->>LVM: _id로 조회
+    LVM-->>ES: 아직 세그먼트 밖 · translog에서 읽어라
     ES-->>C: 최신 문서 반환 · Real-Time
+    Note over ES,SEG: 이때 refresh가 일어나도 internal 스코프 전용
+    Note over ES,SEG: external reader는 그대로 → 검색 가시성 변화 없음
     C->>ES: GET my-index/_search
-    ES->>SEG: 세그먼트 조회
+    ES->>SEG: 역색인 조회 · LiveVersionMap은 보지 않음
     ES-->>C: hits 0건 · 아직 안 보임, NRT
     end
 
-    ES->>SEG: refresh · 기본 1초 주기
+    ES->>SEG: refresh · 기본 1초 주기 · external reader 전진
     rect rgb(212, 237, 218)
     Note over C,SEG: refresh 이후
     C->>ES: GET my-index/_search
@@ -703,6 +892,7 @@ sequenceDiagram
 - [Elastic License FAQ](https://www.elastic.co/pricing/faq/licensing)
 - [Elasticsearch is open source, again (Simon Willison 요약)](https://simonwillison.net/2024/Aug/29/elasticsearch-is-open-source-again/)
 - [Elastic 공식 - Near real-time search](https://www.elastic.co/guide/en/elasticsearch/reference/current/near-real-time.html)
+- [elastic/elasticsearch#45717 - Clarify realtime get API documentation](https://github.com/elastic/elasticsearch/issues/45717) — Get의 refresh가 검색 가시성을 열어주지 않는다는 재현 스크립트
 - [Elastic 공식 - Translog 설정 (8.19)](https://www.elastic.co/guide/en/elasticsearch/reference/8.19/index-modules-translog.html) — flush 조건·기본값 확인용
 - [Elastic 공식 블로그 - Elasticsearch Is Open Source. Again!](https://www.elastic.co/blog/elasticsearch-is-open-source-again) — 2024년 AGPLv3 추가
 - [Apache Lucene - Segments 개념](https://lucene.apache.org/core/)
